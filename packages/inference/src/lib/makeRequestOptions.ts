@@ -1,19 +1,48 @@
-import { FAL_AI_API_BASE_URL, FAL_AI_MODEL_IDS } from "../providers/fal-ai";
-import { REPLICATE_API_BASE_URL, REPLICATE_MODEL_IDS } from "../providers/replicate";
-import { SAMBANOVA_API_BASE_URL, SAMBANOVA_MODEL_IDS } from "../providers/sambanova";
-import { TOGETHER_API_BASE_URL, TOGETHER_MODEL_IDS } from "../providers/together";
-import { INFERENCE_PROVIDERS, type InferenceTask, type Options, type RequestArgs } from "../types";
-import { omit } from "../utils/omit";
-import { HF_HUB_URL } from "./getDefaultTask";
+import { HF_HUB_URL, HF_ROUTER_URL } from "../config";
+import { BLACK_FOREST_LABS_CONFIG } from "../providers/black-forest-labs";
+import { CEREBRAS_CONFIG } from "../providers/cerebras";
+import { COHERE_CONFIG } from "../providers/cohere";
+import { FAL_AI_CONFIG } from "../providers/fal-ai";
+import { FIREWORKS_AI_CONFIG } from "../providers/fireworks-ai";
+import { HF_INFERENCE_CONFIG } from "../providers/hf-inference";
+import { HYPERBOLIC_CONFIG } from "../providers/hyperbolic";
+import { NEBIUS_CONFIG } from "../providers/nebius";
+import { NOVITA_CONFIG } from "../providers/novita";
+import { REPLICATE_CONFIG } from "../providers/replicate";
+import { SAMBANOVA_CONFIG } from "../providers/sambanova";
+import { TOGETHER_CONFIG } from "../providers/together";
+import { OPENAI_CONFIG } from "../providers/openai";
+import type { InferenceProvider, InferenceTask, Options, ProviderConfig, RequestArgs } from "../types";
 import { isUrl } from "./isUrl";
+import { version as packageVersion, name as packageName } from "../../package.json";
+import { getProviderModelId } from "./getProviderModelId";
 
-const HF_INFERENCE_API_BASE_URL = "https://api-inference.huggingface.co";
+const HF_HUB_INFERENCE_PROXY_TEMPLATE = `${HF_ROUTER_URL}/{{PROVIDER}}`;
 
 /**
  * Lazy-loaded from huggingface.co/api/tasks when needed
  * Used to determine the default model to use when it's not user defined
  */
 let tasks: Record<string, { models: { id: string }[] }> | null = null;
+
+/**
+ * Config to define how to serialize requests for each provider
+ */
+const providerConfigs: Record<InferenceProvider, ProviderConfig> = {
+	"black-forest-labs": BLACK_FOREST_LABS_CONFIG,
+	cerebras: CEREBRAS_CONFIG,
+	cohere: COHERE_CONFIG,
+	"fal-ai": FAL_AI_CONFIG,
+	"fireworks-ai": FIREWORKS_AI_CONFIG,
+	"hf-inference": HF_INFERENCE_CONFIG,
+	hyperbolic: HYPERBOLIC_CONFIG,
+	openai: OPENAI_CONFIG,
+	nebius: NEBIUS_CONFIG,
+	novita: NOVITA_CONFIG,
+	replicate: REPLICATE_CONFIG,
+	sambanova: SAMBANOVA_CONFIG,
+	together: TOGETHER_CONFIG,
+};
 
 /**
  * Helper that prepares request arguments
@@ -24,145 +53,108 @@ export async function makeRequestOptions(
 		stream?: boolean;
 	},
 	options?: Options & {
-		/** When a model can be used for multiple tasks, and we want to run a non-default task */
-		forceTask?: string | InferenceTask;
-		/** To load default model if needed */
-		taskHint?: InferenceTask;
+		/** In most cases (unless we pass a endpointUrl) we know the task */
+		task?: InferenceTask;
 		chatCompletion?: boolean;
 	}
 ): Promise<{ url: string; info: RequestInit }> {
-	const { accessToken, endpointUrl, provider, ...otherArgs } = args;
-	let { model } = args;
-	const { forceTask, includeCredentials, taskHint, wait_for_model, use_cache, dont_load_model, chatCompletion } =
-		options ?? {};
+	const { accessToken, endpointUrl, provider: maybeProvider, model: maybeModel, ...remainingArgs } = args;
+	const provider = maybeProvider ?? "hf-inference";
+	const providerConfig = providerConfigs[provider];
 
-	const headers: Record<string, string> = {};
-	if (accessToken) {
-		headers["Authorization"] = provider === "fal-ai" ? `Key ${accessToken}` : `Bearer ${accessToken}`;
+	const { includeCredentials, task, chatCompletion, signal } = options ?? {};
+
+	if (endpointUrl && provider !== "hf-inference") {
+		throw new Error(`Cannot use endpointUrl with a third-party provider.`);
 	}
-
-	if (!model && !tasks && taskHint) {
-		const res = await fetch(`${HF_HUB_URL}/api/tasks`);
-
-		if (res.ok) {
-			tasks = await res.json();
-		}
+	if (maybeModel && isUrl(maybeModel)) {
+		throw new Error(`Model URLs are no longer supported. Use endpointUrl instead.`);
 	}
-
-	if (!model && tasks && taskHint) {
-		const taskInfo = tasks[taskHint];
-		if (taskInfo) {
-			model = taskInfo.models[0].id;
-		}
+	if (!maybeModel && !task) {
+		throw new Error("No model provided, and no task has been specified.");
 	}
-
-	if (!model) {
-		throw new Error("No model provided, and no default model found for this task");
+	if (!providerConfig) {
+		throw new Error(`No provider config found for provider ${provider}`);
 	}
-	if (provider) {
-		if (!INFERENCE_PROVIDERS.includes(provider)) {
-			throw new Error("Unknown Inference provider");
-		}
-		if (!accessToken) {
-			throw new Error("Specifying an Inference provider requires an accessToken");
-		}
+	if (providerConfig.clientSideRoutingOnly && !maybeModel) {
+		throw new Error(`Provider ${provider} requires a model ID to be passed directly.`);
+	}
+	// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+	const hfModel = maybeModel ?? (await loadDefaultModel(task!));
+	const model = providerConfig.clientSideRoutingOnly
+		? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+		  removeProviderPrefix(maybeModel!, provider)
+		: // For closed-models API providers, one needs to pass the model ID directly (e.g. "gpt-3.5-turbo")
+		  await getProviderModelId({ model: hfModel, provider }, args, {
+				task,
+				chatCompletion,
+				fetch: options?.fetch,
+		  });
 
-		const modelId = (() => {
-			switch (provider) {
-				case "replicate":
-					return REPLICATE_MODEL_IDS[model];
-				case "sambanova":
-					return SAMBANOVA_MODEL_IDS[model];
-				case "together":
-					return TOGETHER_MODEL_IDS[model]?.id;
-				case "fal-ai":
-					return FAL_AI_MODEL_IDS[model];
-				default:
-					return model;
+	const authMethod = (() => {
+		if (providerConfig.clientSideRoutingOnly) {
+			// Closed-source providers require an accessToken (cannot be routed).
+			if (accessToken && accessToken.startsWith("hf_")) {
+				throw new Error(`Provider ${provider} is closed-source and does not support HF tokens.`);
 			}
-		})();
-
-		if (!modelId) {
-			throw new Error(`Model ${model} is not supported for provider ${provider}`);
+			return "provider-key";
 		}
+		if (accessToken) {
+			return accessToken.startsWith("hf_") ? "hf-token" : "provider-key";
+		}
+		if (includeCredentials === "include") {
+			// If accessToken is passed, it should take precedence over includeCredentials
+			return "credentials-include";
+		}
+		return "none";
+	})();
 
-		model = modelId;
-	}
+	// Make URL
+	const url = endpointUrl
+		? chatCompletion
+			? endpointUrl + `/v1/chat/completions`
+			: endpointUrl
+		: providerConfig.makeUrl({
+				baseUrl:
+					authMethod !== "provider-key"
+						? HF_HUB_INFERENCE_PROXY_TEMPLATE.replace("{{PROVIDER}}", provider)
+						: providerConfig.baseUrl,
+				model,
+				chatCompletion,
+				task,
+		  });
 
+	// Make headers
 	const binary = "data" in args && !!args.data;
+	const headers = providerConfig.makeHeaders({
+		accessToken,
+		authMethod,
+	});
 
+	// Add content-type to headers
 	if (!binary) {
 		headers["Content-Type"] = "application/json";
 	}
 
-	if (wait_for_model) {
-		headers["X-Wait-For-Model"] = "true";
-	}
-	if (use_cache === false) {
-		headers["X-Use-Cache"] = "false";
-	}
-	if (dont_load_model) {
-		headers["X-Load-Model"] = "0";
-	}
-	if (provider === "replicate") {
-		headers["Prefer"] = "wait";
-	}
+	// Add user-agent to headers
+	// e.g. @huggingface/inference/3.1.3
+	const ownUserAgent = `${packageName}/${packageVersion}`;
+	const userAgent = [ownUserAgent, typeof navigator !== "undefined" ? navigator.userAgent : undefined]
+		.filter((x) => x !== undefined)
+		.join(" ");
+	headers["User-Agent"] = userAgent;
 
-	let url = (() => {
-		if (endpointUrl && isUrl(model)) {
-			throw new TypeError("Both model and endpointUrl cannot be URLs");
-		}
-		if (isUrl(model)) {
-			console.warn("Using a model URL is deprecated, please use the `endpointUrl` parameter instead");
-			return model;
-		}
-		if (endpointUrl) {
-			return endpointUrl;
-		}
-		if (forceTask) {
-			return `${HF_INFERENCE_API_BASE_URL}/pipeline/${forceTask}/${model}`;
-		}
-		if (provider) {
-			if (!accessToken) {
-				throw new Error("Specifying an Inference provider requires an accessToken");
-			}
-			if (accessToken.startsWith("hf_")) {
-				/// TODO we wil proxy the request server-side (using our own keys) and handle billing for it on the user's HF account.
-				throw new Error("Inference proxying is not implemented yet");
-			} else {
-				switch (provider) {
-					case "fal-ai":
-						return `${FAL_AI_API_BASE_URL}/${model}`;
-					case "replicate":
-						if (model.includes(":")) {
-							// Versioned models are in the form of `owner/model:version`
-							return `${REPLICATE_API_BASE_URL}/v1/predictions`;
-						} else {
-							// Unversioned models are in the form of `owner/model`
-							return `${REPLICATE_API_BASE_URL}/v1/models/${model}/predictions`;
-						}
-					case "sambanova":
-						return SAMBANOVA_API_BASE_URL;
-					case "together":
-						if (taskHint === "text-to-image") {
-							return `${TOGETHER_API_BASE_URL}/v1/images/generations`;
-						}
-						return TOGETHER_API_BASE_URL;
-					default:
-						break;
-				}
-			}
-		}
-
-		return `${HF_INFERENCE_API_BASE_URL}/models/${model}`;
-	})();
-
-	if (chatCompletion && !url.endsWith("/chat/completions")) {
-		url += "/v1/chat/completions";
-	}
-	if (provider === "together" && taskHint === "text-generation" && !chatCompletion) {
-		url += "/v1/completions";
-	}
+	// Make body
+	const body = binary
+		? args.data
+		: JSON.stringify(
+				providerConfig.makeBody({
+					args: remainingArgs as Record<string, unknown>,
+					model,
+					task,
+					chatCompletion,
+				})
+		  );
 
 	/**
 	 * For edge runtimes, leave 'credentials' undefined, otherwise cloudflare workers will error
@@ -174,27 +166,40 @@ export async function makeRequestOptions(
 		credentials = "include";
 	}
 
-	/*
-	 * Versioned Replicate models in the format `owner/model:version` expect the version in the body
-	 */
-	if (provider === "replicate" && model.includes(":")) {
-		const version = model.split(":")[1];
-		(otherArgs as typeof otherArgs & { version: string }).version = version;
-	}
-
 	const info: RequestInit = {
 		headers,
 		method: "POST",
-		body: binary
-			? args.data
-			: JSON.stringify({
-					...((otherArgs.model && isUrl(otherArgs.model)) || provider === "replicate" || provider === "fal-ai"
-						? omit(otherArgs, "model")
-						: { ...otherArgs, model }),
-			  }),
+		body,
 		...(credentials ? { credentials } : undefined),
-		signal: options?.signal,
+		signal,
 	};
 
 	return { url, info };
+}
+
+async function loadDefaultModel(task: InferenceTask): Promise<string> {
+	if (!tasks) {
+		tasks = await loadTaskInfo();
+	}
+	const taskInfo = tasks[task];
+	if ((taskInfo?.models.length ?? 0) <= 0) {
+		throw new Error(`No default model defined for task ${task}, please define the model explicitly.`);
+	}
+	return taskInfo.models[0].id;
+}
+
+async function loadTaskInfo(): Promise<Record<string, { models: { id: string }[] }>> {
+	const res = await fetch(`${HF_HUB_URL}/api/tasks`);
+
+	if (!res.ok) {
+		throw new Error("Failed to load tasks definitions from Hugging Face Hub.");
+	}
+	return await res.json();
+}
+
+function removeProviderPrefix(model: string, provider: string): string {
+	if (!model.startsWith(`${provider}/`)) {
+		throw new Error(`Models from ${provider} must be prefixed by "${provider}/". Got "${model}".`);
+	}
+	return model.slice(provider.length + 1);
 }
